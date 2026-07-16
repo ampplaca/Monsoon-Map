@@ -576,11 +576,10 @@ const SB_HEADERS = {
   'Authorization': 'Bearer ' + SUPABASE_ANON_KEY,
   'Content-Type': 'application/json'
 };
-let lastSavedJSON = null; // used to ignore our own echoes when polling
 let suppressIncoming = false; // true while user is mid-interaction (editing/merging/drawing)
 
 async function sbFetchRow(){
-  const res = await fetch(`${SUPABASE_URL}/rest/v1/ckc_war_map?id=eq.${MAP_ROW_ID}&select=data`, {
+  const res = await fetch(`${SUPABASE_URL}/rest/v1/ckc_war_map?id=eq.${MAP_ROW_ID}&select=data,updated_at`, {
     headers: SB_HEADERS
   });
   if(!res.ok){
@@ -588,23 +587,25 @@ async function sbFetchRow(){
     throw new Error('Supabase load failed: ' + res.status + ' ' + text);
   }
   const rows = await res.json();
-  return rows && rows[0] ? rows[0].data : null;
+  return rows && rows[0] ? rows[0] : null;
 }
 
 async function sbSaveRow(stateObj){
   if(!isEditor){
     throw new Error('Not signed in as an approved editor.');
   }
+  const nowIso = new Date().toISOString();
   const headers = Object.assign({}, SB_HEADERS, { 'Prefer':'return=minimal', 'Authorization': authHeaderValue() });
   const res = await fetch(`${SUPABASE_URL}/rest/v1/ckc_war_map?id=eq.${MAP_ROW_ID}`, {
     method: 'PATCH',
     headers,
-    body: JSON.stringify({ data: stateObj, updated_at: new Date().toISOString() })
+    body: JSON.stringify({ data: stateObj, updated_at: nowIso })
   });
   if(!res.ok){
     const text = await res.text().catch(()=> '');
     throw new Error('Supabase save failed: ' + res.status + ' ' + text);
   }
+  return nowIso;
 }
 
 function fillStateDefaults(){
@@ -618,17 +619,19 @@ function fillStateDefaults(){
   if(!state.hiddenBase) state.hiddenBase = [];
 }
 
+let lastKnownUpdatedAt = null; // tracks the DB's updated_at we last saw/wrote, to detect genuinely new changes
+
 async function loadState(){
   setStatus("Loading...");
   try{
-    const data = await sbFetchRow();
-    if(data && Object.keys(data).length){
-      state = data;
+    const row = await sbFetchRow();
+    if(row && row.data && Object.keys(row.data).length){
+      state = row.data;
       fillStateDefaults();
     } else {
       state = freshState();
     }
-    lastSavedJSON = JSON.stringify(state);
+    lastKnownUpdatedAt = row ? row.updated_at : null;
   } catch(e){
     console.error(e);
     state = freshState();
@@ -646,9 +649,8 @@ function saveState(){
   clearTimeout(saveTimer);
   saveTimer = setTimeout(async ()=>{
     try{
-      const json = JSON.stringify(state);
-      lastSavedJSON = json;
-      await sbSaveRow(state);
+      const savedAt = await sbSaveRow(state);
+      lastKnownUpdatedAt = savedAt;
       setStatus("Saved (shared)");
     }catch(e){
       console.error(e);
@@ -663,13 +665,12 @@ function subscribeRealtime(){
   pollTimer = setInterval(async ()=>{
     if(suppressIncoming) return; // don't yank the map out from under an active edit
     try{
-      const data = await sbFetchRow();
-      if(!data) return;
-      const incomingJSON = JSON.stringify(data);
-      if(incomingJSON === lastSavedJSON) return; // nothing new
-      state = data;
+      const row = await sbFetchRow();
+      if(!row) return;
+      if(row.updated_at === lastKnownUpdatedAt) return; // nothing new — same version we already have
+      lastKnownUpdatedAt = row.updated_at;
+      state = row.data;
       fillStateDefaults();
-      lastSavedJSON = incomingJSON;
       selectedGroup = null;
       document.getElementById('panelEmpty').style.display='block';
       document.getElementById('panelBody').style.display='none';
@@ -712,6 +713,7 @@ function makeLabelBar(container, arr){
     sw.disabled = !isEditor;
     sw.style.display = isEditor ? '' : 'none';
     sw.addEventListener('input', ()=>{
+      if(!isEditor) return;
       item.color = sw.value; chip.style.color = sw.value; saveState();
     });
     tile.appendChild(chip);
@@ -865,20 +867,24 @@ function selectGroup(gid){
   const resetShapeBtn = document.getElementById('resetShapeBtn');
   if(members.length>1){
     mergeInfo.textContent = `This tile is merged from ${members.length} traced pieces.`;
-    unmergeRow.style.display='flex';
+    unmergeRow.style.display = isEditor ? 'flex' : 'none';
     editShapeRow.style.display='none';
   } else {
     mergeInfo.textContent = '';
     unmergeRow.style.display='none';
-    editShapeRow.style.display='flex';
-    resetShapeBtn.style.display = (state.shapeOverrides && state.shapeOverrides[gid]) ? 'inline-block' : 'none';
+    editShapeRow.style.display = isEditor ? 'flex' : 'none';
+    resetShapeBtn.style.display = (isEditor && state.shapeOverrides && state.shapeOverrides[gid]) ? 'inline-block' : 'none';
   }
+  document.getElementById('tileName').disabled = !isEditor;
+  document.getElementById('tileColor').disabled = !isEditor;
   renderFootholdList(gid);
   renderGrid();
 }
 
+document.getElementById('tileName').addEventListener('focus', ()=>{ suppressIncoming = true; });
+document.getElementById('tileName').addEventListener('blur', ()=>{ suppressIncoming = false; });
 document.getElementById('tileName').addEventListener('input', (e)=>{
-  if(selectedGroup==null) return;
+  if(!isEditor || selectedGroup==null) return;
   const cur = state.tiles[selectedGroup] || {};
   cur.name = e.target.value;
   state.tiles[selectedGroup] = cur;
@@ -886,7 +892,7 @@ document.getElementById('tileName').addEventListener('input', (e)=>{
   saveState();
 });
 document.getElementById('tileColor').addEventListener('input', (e)=>{
-  if(selectedGroup==null) return;
+  if(!isEditor || selectedGroup==null) return;
   const cur = state.tiles[selectedGroup] || {};
   cur.color = e.target.value;
   state.tiles[selectedGroup] = cur;
@@ -894,7 +900,7 @@ document.getElementById('tileColor').addEventListener('input', (e)=>{
   saveState();
 });
 document.getElementById('clearTileBtn').addEventListener('click', ()=>{
-  if(selectedGroup==null) return;
+  if(!isEditor || selectedGroup==null) return;
   delete state.tiles[selectedGroup];
   document.getElementById('tileName').value='';
   renderFootholdList(selectedGroup);
@@ -915,7 +921,11 @@ function renderFootholdList(gid){
     nameInp.type = 'text';
     nameInp.placeholder = 'Foothold name';
     nameInp.value = fh.name || '';
+    nameInp.disabled = !isEditor;
+    nameInp.addEventListener('focus', ()=>{ suppressIncoming = true; });
+    nameInp.addEventListener('blur', ()=>{ suppressIncoming = false; });
     nameInp.addEventListener('input', ()=>{
+      if(!isEditor) return;
       fh.name = nameInp.value;
       saveState();
       renderGrid();
@@ -927,7 +937,9 @@ function renderFootholdList(gid){
       if((fh.level||1)===L) opt.selected = true;
       lvlSel.appendChild(opt);
     }
+    lvlSel.disabled = !isEditor;
     lvlSel.addEventListener('change', ()=>{
+      if(!isEditor) return;
       fh.level = parseInt(lvlSel.value);
       saveState();
       renderGrid();
@@ -935,7 +947,9 @@ function renderFootholdList(gid){
     const delBtn = document.createElement('button');
     delBtn.textContent = '✕';
     delBtn.title = 'Remove foothold';
+    delBtn.style.display = isEditor ? '' : 'none';
     delBtn.addEventListener('click', ()=>{
+      if(!isEditor) return;
       fhs.splice(i,1);
       renderFootholdList(gid);
       renderGrid();
@@ -949,7 +963,7 @@ function renderFootholdList(gid){
 }
 
 document.getElementById('addFootholdBtn').addEventListener('click', ()=>{
-  if(selectedGroup==null) return;
+  if(!isEditor || selectedGroup==null) return;
   const cur = state.tiles[selectedGroup] || {};
   if(!cur.footholds) cur.footholds = [];
   cur.footholds.push({name:'', level:1});
@@ -992,23 +1006,24 @@ function makeFootholdDraggable(el, fh){
 }
 
 document.getElementById('setHomeBtn').addEventListener('click', ()=>{
-  if(selectedGroup==null) return;
+  if(!isEditor || selectedGroup==null) return;
   state.home = selectedGroup;
   renderGrid();
   saveState();
 });
 document.getElementById('setTargetBtn').addEventListener('click', ()=>{
-  if(selectedGroup==null) return;
+  if(!isEditor || selectedGroup==null) return;
   state.target = selectedGroup;
   renderGrid();
   saveState();
 });
 document.getElementById('clearPathBtn').addEventListener('click', ()=>{
+  if(!isEditor) return;
   state.home = null; state.target = null;
   renderGrid(); saveState();
 });
 document.getElementById('unmergeBtn').addEventListener('click', ()=>{
-  if(selectedGroup==null) return;
+  if(!isEditor || selectedGroup==null) return;
   const members = membersOf(selectedGroup);
   members.forEach(id=>{ delete state.groupOf[id]; });
   delete state.tiles[selectedGroup];
@@ -1024,7 +1039,7 @@ document.getElementById('outlinesToggle').addEventListener('change', renderGrid)
 
 // ---- Edit border (vertex editing) ----
 document.getElementById('editShapeBtn').addEventListener('click', ()=>{
-  if(selectedGroup==null) return;
+  if(!isEditor || selectedGroup==null) return;
   if(mergeMode) exitMergeMode();
   if(addMode) exitAddMode();
   editMode = true;
@@ -1041,7 +1056,7 @@ document.getElementById('editDoneBtn').addEventListener('click', ()=>{
   renderGrid();
 });
 document.getElementById('resetShapeBtn').addEventListener('click', ()=>{
-  if(selectedGroup==null) return;
+  if(!isEditor || selectedGroup==null) return;
   delete state.shapeOverrides[selectedGroup];
   document.getElementById('resetShapeBtn').style.display='none';
   renderGrid();
@@ -1050,7 +1065,7 @@ document.getElementById('resetShapeBtn').addEventListener('click', ()=>{
 
 // ---- Divide tile ----
 document.getElementById('divideBtn').addEventListener('click', ()=>{
-  if(selectedGroup==null) return;
+  if(!isEditor || selectedGroup==null) return;
   if(mergeMode) exitMergeMode();
   if(addMode) exitAddMode();
   if(editMode){ editMode=false; editingId=null; document.getElementById('editBar').classList.remove('show'); }
@@ -1103,7 +1118,7 @@ function renderDivideHandles(){
 }
 
 document.getElementById('divideConfirmBtn').addEventListener('click', ()=>{
-  if(divideSel.length!==2 || !editingId) return;
+  if(!isEditor || divideSel.length!==2 || !editingId) return;
   const reg = REGION_MAP[editingId];
   const pts = effectivePts(reg);
   const [i,j] = [...divideSel].sort((a,b)=>a-b);
@@ -1258,6 +1273,7 @@ function updateMergeBar(){
 }
 
 document.getElementById('mergeModeBtn').addEventListener('click', ()=>{
+  if(!isEditor) return;
   editMode = false; editingId = null;
   document.getElementById('editBar').classList.remove('show');
   if(addMode) exitAddMode();
@@ -1286,6 +1302,7 @@ function exitMergeMode(){
 
 // ---- Add territory ----
 document.getElementById('addTerritoryBtn').addEventListener('click', ()=>{
+  if(!isEditor) return;
   if(mergeMode) exitMergeMode();
   if(editMode){ editMode=false; editingId=null; document.getElementById('editBar').classList.remove('show'); }
   if(divideMode) exitDivideMode();
@@ -1314,7 +1331,7 @@ function exitAddMode(){
 }
 document.getElementById('addCancelBtn').addEventListener('click', exitAddMode);
 document.getElementById('addFinishBtn').addEventListener('click', ()=>{
-  if(drawingPts.length < 3) return;
+  if(!isEditor || drawingPts.length < 3) return;
   const { area, cx, cy } = polyAreaCentroid(drawingPts);
   const newId = 'new' + Date.now();
   const region = { id:newId, area: Math.max(area,1), cx:+cx.toFixed(2), cy:+cy.toFixed(2), pts: drawingPts.map(p=>[+p[0].toFixed(2),+p[1].toFixed(2)]) };
@@ -1370,7 +1387,7 @@ document.getElementById('mergeClearBtn').addEventListener('click', ()=>{
   renderGrid();
 });
 document.getElementById('mergeConfirmBtn').addEventListener('click', ()=>{
-  if(mergeSelection.length < 2) return;
+  if(!isEditor || mergeSelection.length < 2) return;
   // gather full member set across all currently-selected regions' existing groups
   const groups = [...new Set(mergeSelection.map(id=>groupIdOf(id)))];
   const targetGroup = groups[0];
@@ -1480,6 +1497,7 @@ document.getElementById('exportCopyBtn').addEventListener('click', async ()=>{
 });
 
 document.getElementById('resetBtn').addEventListener('click', ()=>{
+  if(!isEditor) return;
   if(!confirm('Reset all tile names, colors, merges, home and target on this map? This cannot be undone.')) return;
   state = freshState();
   selectedGroup = null;
@@ -1616,6 +1634,15 @@ function parseAuthRedirect(){
       saveSession(token, display);
       history.replaceState(null, '', location.pathname + location.search);
     }
+  } else if(location.hash && (location.hash.includes('error=') || location.hash.includes('error_description='))){
+    const params = new URLSearchParams(location.hash.slice(1));
+    const desc = decodeURIComponent(params.get('error_description') || params.get('error') || 'Sign-in failed');
+    console.error('Discord sign-in error:', desc);
+    setTimeout(()=>{
+      const msg = document.getElementById('authMsg');
+      if(msg) msg.textContent = '⚠️ ' + desc;
+    }, 0);
+    history.replaceState(null, '', location.pathname + location.search);
   } else {
     try{
       const t = localStorage.getItem('ckcwm_token');
