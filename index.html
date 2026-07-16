@@ -346,6 +346,7 @@
   <span style="width:1px;height:20px;background:var(--line);"></span>
   <button id="resetBtn" class="danger editor-only">Reset map</button>
   <button id="exportBtn">⬇️ Export merges</button>
+  <button id="refreshBtn">🔄 Refresh</button>
   <span class="status" id="statusText">Loaded</span>
 </div>
 
@@ -410,6 +411,10 @@
       <div class="field">
         <label>Tile color</label>
         <input type="color" id="tileColor" value="#e05e1f">
+      </div>
+      <div class="rowbtns editor-only">
+        <button id="copyColorBtn">📋 Copy color</button>
+        <button id="pasteColorBtn" disabled>🎨 Paste color</button>
       </div>
       <div class="rowbtns editor-only">
         <button class="primary" id="setHomeBtn">🏠 Set Home</button>
@@ -519,6 +524,7 @@ let divideMode = false;
 let divideSel = []; // up to 2 vertex indices
 let editMode = false;
 let editingId = null;
+let copiedColor = null;
 
 function freshState(){
   return {
@@ -659,27 +665,31 @@ function saveState(){
   }, 400);
 }
 
-let pollTimer = null;
-function subscribeRealtime(){
-  // Polling rather than a websocket subscription, so no external client library is required.
-  pollTimer = setInterval(async ()=>{
-    if(suppressIncoming) return; // don't yank the map out from under an active edit
-    try{
-      const row = await sbFetchRow();
-      if(!row) return;
-      if(row.updated_at === lastKnownUpdatedAt) return; // nothing new — same version we already have
-      lastKnownUpdatedAt = row.updated_at;
-      state = row.data;
-      fillStateDefaults();
-      selectedGroup = null;
-      document.getElementById('panelEmpty').style.display='block';
-      document.getElementById('panelBody').style.display='none';
-      setStatus("Updated by a teammate");
-      render();
-    }catch(e){
-      console.error(e);
+async function manualRefresh(){
+  if(suppressIncoming){
+    setStatus("Finish what you're doing first, then refresh");
+    return;
+  }
+  setStatus("Refreshing...", true);
+  try{
+    const row = await sbFetchRow();
+    if(!row){ setStatus("Nothing to refresh"); return; }
+    if(row.updated_at === lastKnownUpdatedAt){
+      setStatus("Already up to date");
+      return;
     }
-  }, 5000);
+    lastKnownUpdatedAt = row.updated_at;
+    state = row.data;
+    fillStateDefaults();
+    selectedGroup = null;
+    document.getElementById('panelEmpty').style.display='block';
+    document.getElementById('panelBody').style.display='none';
+    setStatus("Updated with latest changes");
+    render();
+  }catch(e){
+    console.error(e);
+    setStatus("Refresh failed — check connection");
+  }
 }
 
 function setStatus(t, saving){
@@ -877,6 +887,7 @@ function selectGroup(gid){
   }
   document.getElementById('tileName').disabled = !isEditor;
   document.getElementById('tileColor').disabled = !isEditor;
+  document.getElementById('pasteColorBtn').disabled = !isEditor || !copiedColor;
   renderFootholdList(gid);
   renderGrid();
 }
@@ -896,6 +907,21 @@ document.getElementById('tileColor').addEventListener('input', (e)=>{
   const cur = state.tiles[selectedGroup] || {};
   cur.color = e.target.value;
   state.tiles[selectedGroup] = cur;
+  renderGrid();
+  saveState();
+});
+document.getElementById('copyColorBtn').addEventListener('click', ()=>{
+  if(selectedGroup==null) return;
+  copiedColor = document.getElementById('tileColor').value;
+  document.getElementById('pasteColorBtn').disabled = !isEditor;
+  setStatus('Color copied — select a tile and hit Paste color');
+});
+document.getElementById('pasteColorBtn').addEventListener('click', ()=>{
+  if(!isEditor || selectedGroup==null || !copiedColor) return;
+  const cur = state.tiles[selectedGroup] || {};
+  cur.color = copiedColor;
+  state.tiles[selectedGroup] = cur;
+  document.getElementById('tileColor').value = copiedColor;
   renderGrid();
   saveState();
 });
@@ -1652,6 +1678,8 @@ function parseAuthRedirect(){
   }
 }
 
+document.getElementById('refreshBtn').addEventListener('click', manualRefresh);
+
 function render(){
   rebuildRegionIndex();
   applyTagSize();
@@ -1662,7 +1690,7 @@ function render(){
 parseAuthRedirect();
 updateAuthUI();
 loadState();
-subscribeRealtime();
+
 </script>
 </body>
 </html>
